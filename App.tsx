@@ -1,213 +1,357 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, StatusBar, FlatList, Platform } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, StatusBar, FlatList, Platform, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { NetworkInfo } from 'react-native-network-info';
-import TcpSocket from 'react-native-tcp-socket';
+import BluetoothSerial from 'react-native-bluetooth-serial';
 
 interface Message {
-  id: number;
+  id: string;
   text: string;
   sender: 'Me' | 'Other';
+  timestamp: number;
 }
 
+interface BluetoothDevice {
+  id: string;
+  name: string;
+}
+
+// Helper function to generate truly unique IDs
+const generateUniqueId = (): string => {
+  return Date.now().toString() + '-' + Math.random().toString(36).substr(2, 9);
+};
+
 export default function App() {
-  const [ipAddress, setIpAddress] = useState('');
   const [deviceName, setDeviceName] = useState('');
-  const [targetIp, setTargetIp] = useState('');
+  const [macAddress, setMacAddress] = useState('');
   const [connectionStatus, setConnectionStatus] = useState('Desconectado');
   const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const [messageText, setMessageText] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
-  const [ipHistory, setIpHistory] = useState<string[]>([]);
-  const clientRef = useRef<TcpSocket.Socket | null>(null);
-  const serverRef = useRef<TcpSocket.Server | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [isBluetoothEnabled, setIsBluetoothEnabled] = useState(false);
+  const [availableDevices, setAvailableDevices] = useState<BluetoothDevice[]>([]);
+  const [pairedDevices, setPairedDevices] = useState<BluetoothDevice[]>([]);
+  const [showDeviceList, setShowDeviceList] = useState(false);
+  const dataListenerRef = useRef<{ remove: () => void } | null>(null);
+  const messagesEndRef = useRef<FlatList<Message>>(null);
 
   useEffect(() => {
-    // Obtener dirección IP y nombre del dispositivo al iniciar
-    const initializeDevice = async () => {
-      const ip = await NetworkInfo.getIPV4Address();
-      setIpAddress(ip || '');
-      setDeviceName( 'ChatTCP: ' + ip || '');
-      startServer(ip || '');
+    // Inicializar Bluetooth al iniciar
+    const initializeBluetooth = async () => {
+      try {
+        await BluetoothSerial.requestEnable();
+        const enabled = await BluetoothSerial.isEnabled();
+        setIsBluetoothEnabled(enabled);
+        
+        if (enabled) {
+          const deviceList = await BluetoothSerial.list();
+          setDeviceName('ChatBT');
+          setMacAddress('');
+          
+          // Configurar la escucha de datos entrantes
+          const dataListener = BluetoothSerial.on('data', (data) => {
+            if (data === '__HEARTBEAT__') {
+              BluetoothSerial.write('__HEARTBEAT_ACK__');
+              return;
+            }
+            if (inactivityTimerRef.current) {
+              clearTimeout(inactivityTimerRef.current);
+            }
+            inactivityTimerRef.current = setTimeout(() => {
+              disconnectPeer();
+            }, 30000); // 30 segundos timeout
+            
+            // Usar el nuevo generador de IDs
+            const newMessage: Message = {
+              id: generateUniqueId(),
+              text: data,
+              sender: 'Other',
+              timestamp: Date.now()
+            };
+            
+            setMessages(prevMessages => {
+    const isDuplicate = prevMessages.some(msg => 
+      msg.text === data && 
+      msg.sender === 'Other' && 
+      Date.now() - msg.timestamp < 2000
+    );
+    
+    if (isDuplicate) return prevMessages;
+    
+    return [...prevMessages, {
+      id: generateUniqueId(),
+      text: data,
+      sender: 'Other',
+      timestamp: Date.now()
+    }];
+  });
+          });
+          dataListenerRef.current = dataListener;
+          
+          // Obtener dispositivos emparejados
+          updatePairedDevices();
+        }
+      } catch (error) {
+        console.log('Error al inicializar Bluetooth:', error);
+        Alert.alert('Error', 'No se pudo activar Bluetooth');
+      }
     };
-    initializeDevice();
-
+    
+    initializeBluetooth();
+    
     return () => {
-      serverRef.current?.close();
-      clientRef.current?.destroy();
+      // Limpiar al desmontar
+      if (dataListenerRef.current) dataListenerRef.current.remove();
+      disconnectPeer();
+      if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, []);
-
-  const startServer = (ip: string) => {
-    const server = TcpSocket.createServer(socket => {
-      socket.on('data', (data) => {
-        const message = data.toString();
-        if (message === '__HEARTBEAT__') {
-          socket.write('__HEARTBEAT_ACK__');
-          return;
-        }
-        if (inactivityTimerRef.current) {
-          clearTimeout(inactivityTimerRef.current);
-        }
-        inactivityTimerRef.current = setTimeout(() => {
-          disconnectPeer();
-        }, 30000); // 30 seconds timeout
-        setMessages(prev => [...prev, { id: Date.now(), text: message, sender: 'Other' }]);
-      });
-
-      socket.on('error', (error) => {
-        console.log('Error en conexión entrante:', error);
-      });
-    });
-
-    server.listen({ port: 5050, host: ip, reuseAddress: true }, () => {
-      console.log('Servidor escuchando en', ip);
-      setConnectionStatus(`Esperando conexión en: ${ip}`);
-    });
-
-    serverRef.current = server;
+  
+  // Scroll to bottom when messages change
+  useEffect(() => {
+    if (messages.length > 0 && messagesEndRef.current) {
+      messagesEndRef.current.scrollToEnd({ animated: true });
+    }
+  }, [messages]);
+  
+  const updatePairedDevices = async () => {
+    try {
+      const devices = await BluetoothSerial.list();
+      setPairedDevices(devices);
+    } catch (error) {
+      console.log('Error al obtener dispositivos emparejados:', error);
+    }
+  };
+  
+  const scanForDevices = async () => {
+    try {
+      setConnectionStatus('Buscando dispositivos...');
+      setShowDeviceList(true);
+      
+      const devices = await BluetoothSerial.discoverUnpairedDevices();
+      setAvailableDevices(devices);
+      setConnectionStatus(isConnected ? `Conectado a: ${deviceName}` : 'Listo para conectar');
+    } catch (error) {
+      console.log('Error al buscar dispositivos:', error);
+      setConnectionStatus('Error en búsqueda');
+    }
   };
 
-  const connectToPeer = () => {
-    if (!targetIp.trim() || isConnected) return;
-
-    const client = TcpSocket.createConnection({
-      host: targetIp,
-      port: 5050,
-      timeout: 5000
-    });
-
-    const resetInactivityTimer = () => {
+  const connectToDevice = async (device: BluetoothDevice) => {
+    if (isConnected) return;
+    console.log('Conectando a:', device);
+    try {
+      setConnectionStatus(`Conectando a ${device.name || device.id}...`);
+      console.log('Intentando conectar a:', device);
+      // Intentar conectar
+      await BluetoothSerial.connect(device.id);
+      
+      setConnectionStatus(`Conectado a: ${device.name || device.id}`);
+      setDeviceName(device.name || 'Dispositivo');
+      setMacAddress(device.id);
+      setIsConnected(true);
+      setShowDeviceList(false);
+      
+      // Iniciar heartbeat
+      intervalRef.current = setInterval(() => {
+        if (isConnected) {
+          BluetoothSerial.write('__HEARTBEAT__');
+        }
+      }, 5000);
+      
+      // Configurar temporizador de inactividad
       if (inactivityTimerRef.current) {
         clearTimeout(inactivityTimerRef.current);
       }
       inactivityTimerRef.current = setTimeout(() => {
         disconnectPeer();
       }, 30000); // 30 segundos
-    };
-
-    client.on('connect', () => {
-      console.log('Conexión exitosa con:', targetIp);
-      setConnectionStatus(`Conectado a: ${targetIp}`);
-      setIsConnected(true);
-      setIpHistory(prev => [...new Set([...prev, targetIp])]);
-      resetInactivityTimer();
-      
-      // Heartbeat
-      const interval = setInterval(() => {
-        if (client.writable) client.write('__HEARTBEAT__');
-      }, 5000);
-
-      client.on('close', () => {
-        clearInterval(interval);
-        setIsConnected(false);
-        setConnectionStatus('Desconectado');
-      });
-    });
-
-    client.on('data', (data) => {
-      const message = data.toString();
-      if (message === '__HEARTBEAT_ACK__') return;
-      setMessages(prev => [...prev, { id: Date.now(), text: message, sender: 'Other' }]);
-    });
-
-    client.on('error', (error) => {
+    } catch (error) {
       console.log('Error de conexión:', error);
-      setConnectionStatus(`Error: ${error.message}`);
-      setIsConnected(false);
-    });
-
-    clientRef.current = client;
+      setConnectionStatus(`Error: No se pudo conectar`);
+      Alert.alert('Error de conexión', `No se pudo conectar al dispositivo: ${device.name || device.id}`);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (inactivityTimerRef.current) {
+        clearTimeout(inactivityTimerRef.current);
+        inactivityTimerRef.current = null;
+      }
+    }
   };
 
-  const sendMessage = () => {
-    if (!messageText.trim() || !clientRef.current || !isConnected) return;
+  const sendMessage = async () => {
+    if (!messageText.trim() || !isConnected) return;
 
-    clientRef.current.write(messageText);
-    setMessages(prev => [...prev, { id: Date.now(), text: messageText, sender: 'Me' }]);
-    setMessageText('');
+    try {
+      await BluetoothSerial.write(messageText);
+      const newMessage: Message = {
+        id: generateUniqueId(),
+        text: messageText,
+        sender: 'Me',
+        timestamp: Date.now()
+      };
+      
+      setMessages(prevMessages => {
+    const isDuplicate = prevMessages.some(msg => 
+      msg.text === data && 
+      msg.sender === 'Other' && 
+      Date.now() - msg.timestamp < 2000
+    );
+    
+    if (isDuplicate) return prevMessages;
+    
+    return [...prevMessages, {
+      id: generateUniqueId(),
+      text: data,
+      sender: 'Other',
+      timestamp: Date.now()
+    }];
+  });
+      setMessageText('');
+      
+      // Reiniciar temporizador de inactividad
+      if (inactivityTimerRef.current) {
+        clearTimeout(inactivityTimerRef.current);
+      }
+      inactivityTimerRef.current = setTimeout(() => {
+        disconnectPeer();
+      }, 30000); // 30 segundos
+    } catch (error) {
+      console.log('Error al enviar mensaje:', error);
+      Alert.alert('Error', 'No se pudo enviar el mensaje');
+    }
   };
 
-  const disconnectPeer = () => {
+  const disconnectPeer = async () => {
     if (inactivityTimerRef.current) {
       clearTimeout(inactivityTimerRef.current);
       inactivityTimerRef.current = null;
     }
-    if (clientRef.current) {
-      clientRef.current.destroy();
-      clientRef.current = null;
+    
+    try {
+      await BluetoothSerial.disconnect();
+    } catch (error) {
+      console.log('Error al desconectar:', error);
     }
+    
     setIsConnected(false);
     setConnectionStatus('Desconectado');
-    setMessages([]);
   };
+
+  const toggleBluetooth = async () => {
+    try {
+      if (isBluetoothEnabled) {
+        await BluetoothSerial.disable();
+        setIsBluetoothEnabled(false);
+        setConnectionStatus('Bluetooth desactivado');
+      } else {
+        await BluetoothSerial.requestEnable();
+        setIsBluetoothEnabled(true);
+        setConnectionStatus('Bluetooth activado');
+        updatePairedDevices();
+      }
+    } catch (error) {
+      console.log('Error al cambiar estado de Bluetooth:', error);
+    }
+  };
+
+  const renderDeviceItem = ({ item }: { item: BluetoothDevice }) => (
+    <TouchableOpacity
+      style={styles.deviceItem}
+      onPress={() => connectToDevice(item)}
+    >
+      <View>
+        <Text style={styles.deviceName}>{item.name || 'Dispositivo desconocido'}</Text>
+        <Text style={styles.deviceAddress}>{item.id}</Text>
+      </View>
+      <Ionicons name="bluetooth" size={20} color="#0f065a" />
+    </TouchableOpacity>
+  );
+
+  const renderMessageItem = ({ item }: { item: Message }) => (
+    <View style={[
+      styles.messageBubble,
+      item.sender === 'Me' ? styles.sentMessage : styles.receivedMessage
+    ]}>
+      <Text style={styles.messageText}>{item.text}</Text>
+      <Text style={styles.messageTime}>
+        {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+      </Text>
+    </View>
+  );
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#0f065a" />
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>{deviceName}</Text>
-        <Text style={styles.headerSubtitle}>{ipAddress}</Text>
+        <Text style={styles.headerTitle}>{deviceName || 'ChatBT'}</Text>
+        <Text style={styles.headerSubtitle}>{macAddress}</Text>
         <Text style={[styles.headerSubtitle, styles.connectionStatus]}>{connectionStatus}</Text>
       </View>
       <View style={styles.content}>
         <View style={styles.connectionContainer}>
-          <View style={styles.ipInputContainer}>
-            <TextInput
-              style={styles.input}
-              placeholder="IP del compañero"
-              value={targetIp}
-              onChangeText={setTargetIp}
-              keyboardType="numeric"
-              editable={!isConnected}
-            />
-            {ipHistory.length > 0 && !isConnected && (
-              <FlatList
-                data={ipHistory}
-                style={styles.ipHistoryList}
-                keyExtractor={(item) => item}
-                renderItem={({ item }) => (
-                  <TouchableOpacity
-                    style={styles.ipHistoryItem}
-                    onPress={() => setTargetIp(item)}
-                  >
-                    <Text style={styles.ipHistoryText}>{item}</Text>
-                  </TouchableOpacity>
-                )}
-              />
-            )}
-          </View>
-          {isConnected ? (
-            <TouchableOpacity
-              style={[styles.button, styles.disconnectButton]}
-              onPress={disconnectPeer}
-            >
-              <Text style={styles.buttonText}>Desconectar</Text>
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity
-              style={[styles.button, styles.connectButton]}
-              onPress={connectToPeer}
-            >
-              <Text style={styles.buttonText}>Conectar</Text>
-            </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.button, isBluetoothEnabled ? styles.connectButton : styles.disconnectButton]}
+            onPress={toggleBluetooth}
+          >
+            <Text style={styles.buttonText}>
+              {isBluetoothEnabled ? 'Bluetooth ON' : 'Bluetooth OFF'}
+            </Text>
+          </TouchableOpacity>
+          
+          {isBluetoothEnabled && (
+            <>
+              {isConnected ? (
+                <TouchableOpacity
+                  style={[styles.button, styles.disconnectButton]}
+                  onPress={disconnectPeer}
+                >
+                  <Text style={styles.buttonText}>Desconectar</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.button, styles.connectButton]}
+                  onPress={scanForDevices}
+                >
+                  <Text style={styles.buttonText}>Buscar dispositivos</Text>
+                </TouchableOpacity>
+              )}
+            </>
           )}
         </View>
 
-        <FlatList
-          data={messages}
-          keyExtractor={(item) => item.id.toString()}
-          renderItem={({ item }) => (
-            <View style={[
-              styles.messageBubble,
-              item.sender === 'Me' ? styles.sentMessage : styles.receivedMessage
-            ]}>
-              <Text style={styles.messageText}>{item.text}</Text>
-            </View>
-          )}
-          contentContainerStyle={styles.messagesContainer}
-        />
+        {showDeviceList && !isConnected && (
+          <View style={styles.deviceListContainer}>
+            <Text style={styles.deviceListTitle}>Dispositivos emparejados</Text>
+            <FlatList
+              data={pairedDevices}
+              keyExtractor={(item) => item.id}
+              renderItem={renderDeviceItem}
+              ListEmptyComponent={<Text style={styles.emptyListText}>No hay dispositivos emparejados</Text>}
+              style={styles.deviceList}
+            />
+            
+            <Text style={styles.deviceListTitle}>Dispositivos disponibles</Text>
+            <FlatList
+              data={availableDevices}
+              keyExtractor={(item) => item.id}
+              renderItem={renderDeviceItem}
+              ListEmptyComponent={<Text style={styles.emptyListText}>No se encontraron dispositivos</Text>}
+              style={styles.deviceList}
+            />
+          </View>
+        )}
+
+        {!showDeviceList && (
+          <FlatList
+            ref={messagesEndRef}
+            data={messages}
+            keyExtractor={(item) => item.id}
+            renderItem={renderMessageItem}
+            contentContainerStyle={styles.messagesContainer}
+  extraData={messages.length}
+          />
+        )}
 
         <View style={styles.inputContainer}>
           <TextInput
@@ -218,7 +362,11 @@ export default function App() {
             editable={isConnected}
           />
           <TouchableOpacity
-            style={[styles.button, styles.sendButton]}
+            style={[
+              styles.button, 
+              styles.sendButton,
+              !isConnected && styles.disabledButton
+            ]}
             onPress={sendMessage}
             disabled={!isConnected}
           >
@@ -280,12 +428,55 @@ const styles = StyleSheet.create({
       },
     }),
   },
-  input: {
+  deviceListContainer: {
     flex: 1,
-    backgroundColor: '#F5F5F5',
-    borderRadius: 8,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 8,
+    marginBottom: 16,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 4,
+      },
+    }),
+  },
+  deviceListTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#0f065a',
+    marginVertical: 8,
+    paddingHorizontal: 8,
+  },
+  deviceList: {
+    maxHeight: 150,
+  },
+  deviceItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     padding: 12,
-    fontSize: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  deviceName: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#2C3E50',
+  },
+  deviceAddress: {
+    fontSize: 12,
+    color: '#95A5A6',
+  },
+  emptyListText: {
+    padding: 16,
+    textAlign: 'center',
+    color: '#95A5A6',
   },
   button: {
     borderRadius: 8,
@@ -293,6 +484,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
+    flex: 1,
   },
   connectButton: {
     backgroundColor: '#0f065a',
@@ -300,12 +492,16 @@ const styles = StyleSheet.create({
   disconnectButton: {
     backgroundColor: '#95A5A6',
   },
+  disabledButton: {
+    opacity: 0.5,
+  },
   sendButton: {
     backgroundColor: '#0f065a',
     borderRadius: 24,
     width: 48,
     height: 48,
     padding: 0,
+    flex: 0,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -350,6 +546,12 @@ const styles = StyleSheet.create({
     fontSize: 15,
     lineHeight: 20,
   },
+  messageTime: {
+    fontSize: 10,
+    color: '#95A5A6',
+    alignSelf: 'flex-end',
+    marginTop: 4,
+  },
   inputContainer: {
     flexDirection: 'row',
     gap: 8,
@@ -367,39 +569,5 @@ const styles = StyleSheet.create({
     padding: 12,
     fontSize: 15,
     maxHeight: 100,
-  },
-  ipInputContainer: {
-    flex: 1,
-    position: 'relative',
-  },
-  ipHistoryList: {
-    position: 'absolute',
-    top: '100%',
-    left: 0,
-    right: 0,
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    maxHeight: 150,
-    zIndex: 1,
-    ...Platform.select({
-      ios: {
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.1,
-        shadowRadius: 4,
-      },
-      android: {
-        elevation: 4,
-      },
-    }),
-  },
-  ipHistoryItem: {
-    padding: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  ipHistoryText: {
-    fontSize: 15,
-    color: '#2C3E50',
   },
 });
