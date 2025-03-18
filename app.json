@@ -19,8 +19,18 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "com.keiv.chatapp"
+      "package": "com.keiv.chatapp",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "INTERNET"
+      ]
     },
+    "plugins": [
+      "expo-nearby-connections"
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
     }
