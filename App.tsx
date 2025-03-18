@@ -12,20 +12,26 @@ interface Message {
 
 export default function App() {
   const [ipAddress, setIpAddress] = useState('');
+  const [deviceName, setDeviceName] = useState('');
   const [targetIp, setTargetIp] = useState('');
   const [connectionStatus, setConnectionStatus] = useState('Desconectado');
+  const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [messageText, setMessageText] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [ipHistory, setIpHistory] = useState<string[]>([]);
   const clientRef = useRef<TcpSocket.Socket | null>(null);
   const serverRef = useRef<TcpSocket.Server | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    // Obtener dirección IP al iniciar
-    NetworkInfo.getIPV4Address().then(ip => {
+    // Obtener dirección IP y nombre del dispositivo al iniciar
+    const initializeDevice = async () => {
+      const ip = await NetworkInfo.getIPV4Address();
       setIpAddress(ip || '');
+      setDeviceName( 'ChatTCP: ' + ip || '');
       startServer(ip || '');
-    });
+    };
+    initializeDevice();
 
     return () => {
       serverRef.current?.close();
@@ -41,6 +47,12 @@ export default function App() {
           socket.write('__HEARTBEAT_ACK__');
           return;
         }
+        if (inactivityTimerRef.current) {
+          clearTimeout(inactivityTimerRef.current);
+        }
+        inactivityTimerRef.current = setTimeout(() => {
+          disconnectPeer();
+        }, 30000); // 30 seconds timeout
         setMessages(prev => [...prev, { id: Date.now(), text: message, sender: 'Other' }]);
       });
 
@@ -66,10 +78,21 @@ export default function App() {
       timeout: 5000
     });
 
+    const resetInactivityTimer = () => {
+      if (inactivityTimerRef.current) {
+        clearTimeout(inactivityTimerRef.current);
+      }
+      inactivityTimerRef.current = setTimeout(() => {
+        disconnectPeer();
+      }, 30000); // 30 segundos
+    };
+
     client.on('connect', () => {
       console.log('Conexión exitosa con:', targetIp);
       setConnectionStatus(`Conectado a: ${targetIp}`);
       setIsConnected(true);
+      setIpHistory(prev => [...new Set([...prev, targetIp])]);
+      resetInactivityTimer();
       
       // Heartbeat
       const interval = setInterval(() => {
@@ -79,6 +102,7 @@ export default function App() {
       client.on('close', () => {
         clearInterval(interval);
         setIsConnected(false);
+        setConnectionStatus('Desconectado');
       });
     });
 
@@ -105,32 +129,70 @@ export default function App() {
     setMessageText('');
   };
 
+  const disconnectPeer = () => {
+    if (inactivityTimerRef.current) {
+      clearTimeout(inactivityTimerRef.current);
+      inactivityTimerRef.current = null;
+    }
+    if (clientRef.current) {
+      clientRef.current.destroy();
+      clientRef.current = null;
+    }
+    setIsConnected(false);
+    setConnectionStatus('Desconectado');
+    setMessages([]);
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#0f065a" />
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Chat P2P</Text>
-        <Text style={styles.headerSubtitle}>{connectionStatus}</Text>
+        <Text style={styles.headerTitle}>{deviceName}</Text>
+        <Text style={styles.headerSubtitle}>{ipAddress}</Text>
+        <Text style={[styles.headerSubtitle, styles.connectionStatus]}>{connectionStatus}</Text>
       </View>
       <View style={styles.content}>
         <View style={styles.connectionContainer}>
-          <TextInput
-            style={styles.input}
-            placeholder="IP del compañero"
-            value={targetIp}
-            onChangeText={setTargetIp}
-            keyboardType="numeric"
-            editable={!isConnected}
-          />
-          <TouchableOpacity
-            style={[styles.button, isConnected ? styles.disconnectButton : styles.connectButton]}
-            onPress={connectToPeer}
-            disabled={isConnected}
-          >
-            <Text style={styles.buttonText}>
-              {isConnected ? 'Conectado' : 'Conectar'}
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.ipInputContainer}>
+            <TextInput
+              style={styles.input}
+              placeholder="IP del compañero"
+              value={targetIp}
+              onChangeText={setTargetIp}
+              keyboardType="numeric"
+              editable={!isConnected}
+            />
+            {ipHistory.length > 0 && !isConnected && (
+              <FlatList
+                data={ipHistory}
+                style={styles.ipHistoryList}
+                keyExtractor={(item) => item}
+                renderItem={({ item }) => (
+                  <TouchableOpacity
+                    style={styles.ipHistoryItem}
+                    onPress={() => setTargetIp(item)}
+                  >
+                    <Text style={styles.ipHistoryText}>{item}</Text>
+                  </TouchableOpacity>
+                )}
+              />
+            )}
+          </View>
+          {isConnected ? (
+            <TouchableOpacity
+              style={[styles.button, styles.disconnectButton]}
+              onPress={disconnectPeer}
+            >
+              <Text style={styles.buttonText}>Desconectar</Text>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={[styles.button, styles.connectButton]}
+              onPress={connectToPeer}
+            >
+              <Text style={styles.buttonText}>Conectar</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         <FlatList
@@ -190,6 +252,9 @@ const styles = StyleSheet.create({
   headerSubtitle: {
     fontSize: 14,
     color: 'rgba(255,255,255,0.8)',
+  },
+  connectionStatus: {
+    marginTop: 4,
   },
   content: {
     flex: 1,
@@ -302,5 +367,39 @@ const styles = StyleSheet.create({
     padding: 12,
     fontSize: 15,
     maxHeight: 100,
+  },
+  ipInputContainer: {
+    flex: 1,
+    position: 'relative',
+  },
+  ipHistoryList: {
+    position: 'absolute',
+    top: '100%',
+    left: 0,
+    right: 0,
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    maxHeight: 150,
+    zIndex: 1,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 4,
+      },
+    }),
+  },
+  ipHistoryItem: {
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  ipHistoryText: {
+    fontSize: 15,
+    color: '#2C3E50',
   },
 });
